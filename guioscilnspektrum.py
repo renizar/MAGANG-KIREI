@@ -40,6 +40,7 @@ import serial.tools.list_ports
 
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
+from scipy.signal import find_peaks
 
 # ================= KONFIGURASI PROTOKOL (harus sama dgn sisi Arduino) =================
 SYNC_BYTES = b"\xAA\x55"
@@ -219,6 +220,18 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         self.fft_scale_combo.addItems(["dB", "Linear"])
         self.fft_scale_combo.currentTextChanged.connect(self._redraw_fft)
         ctrl_layout.addWidget(self.fft_scale_combo)
+
+        ctrl_layout.addWidget(QtWidgets.QLabel("Start (Hz):"))
+        self.fft_start_edit = QtWidgets.QLineEdit("10")
+        self.fft_start_edit.setFixedWidth(70)
+        self.fft_start_edit.editingFinished.connect(self._redraw_fft)
+        ctrl_layout.addWidget(self.fft_start_edit)
+
+        ctrl_layout.addWidget(QtWidgets.QLabel("Stop (Hz):"))
+        self.fft_stop_edit = QtWidgets.QLineEdit("500000")
+        self.fft_stop_edit.setFixedWidth(80)
+        self.fft_stop_edit.editingFinished.connect(self._redraw_fft)
+        ctrl_layout.addWidget(self.fft_stop_edit)
 
         # --- tab Waveform & Spectrum ---
         self.tabs = QtWidgets.QTabWidget()
@@ -450,6 +463,25 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
             magnitude = 20 * np.log10(magnitude + eps)
 
         return freqs, magnitude
+    
+    def _parabolic_interpolation(self, mag_plot, freqs_plot, peak_idx):
+        """Estimasi posisi puncak sebenarnya (sub-bin) pakai interpolasi parabola 
+        dari 3 titik di sekitar bin puncak."""
+        if peak_idx <= 0 or peak_idx >= len(mag_plot) - 1:
+            return freqs_plot[peak_idx]
+        
+        y1 = mag_plot[peak_idx - 1]
+        y2 = mag_plot[peak_idx]
+        y3 = mag_plot[peak_idx + 1]
+        
+        denom = (y1 - 2*y2 + y3)
+        if denom == 0:
+            return freqs_plot[peak_idx]
+        
+        delta = 0.5 * (y1 - y3) / denom
+        bin_spacing = freqs_plot[peak_idx] - freqs_plot[peak_idx - 1]
+        
+        return freqs_plot[peak_idx] + delta * bin_spacing
 
     def _redraw_fft(self, *_):
         if self._voltage is None or self._interval_s is None:
@@ -459,7 +491,6 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         if freqs is None:
             return
 
-        # buang bin DC (index 0) karena sumbu-x pakai skala log
         freqs_plot = freqs[1:]
         mag_plot = magnitude[1:]
         if len(freqs_plot) == 0:
@@ -470,9 +501,39 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         ylabel = "Magnitude (dB)" if self.fft_scale_combo.currentText() == "dB" else "Magnitude (V)"
         self.plot_fft.setLabel("left", ylabel)
 
-        peak_idx = int(np.argmax(mag_plot))
-        peak_freq = freqs_plot[peak_idx]
-        self.peak_fft_label.setText(f"{peak_freq:.2f} Hz")
+        # --- deteksi multi-puncak pakai scipy find_peaks ---
+        is_db = self.fft_scale_combo.currentText() == "dB"
+        threshold = np.max(mag_plot) - 20 if is_db else np.max(mag_plot) * 0.1
+        peak_indices, _ = find_peaks(mag_plot, height=threshold, distance=5)
+
+        if len(peak_indices) > 0:
+            peak_freqs = freqs_plot[peak_indices]
+            peak_mags = mag_plot[peak_indices]
+            self.curve_peaks.setData(peak_freqs, peak_mags)
+
+            order = np.argsort(peak_mags)[::-1][:5]
+            unit = "dB" if is_db else "V"
+            lines = [f"{peak_freqs[i]:.1f} Hz   ({peak_mags[i]:.2f} {unit})" for i in order]
+            self.peaks_list_label.setText("\n".join(lines))
+
+            top_idx = order[0]
+            interpolated_freq = self._parabolic_interpolation(mag_plot, freqs_plot, peak_indices[top_idx])
+            self.peak_fft_label.setText(f"{interpolated_freq:.2f} Hz")
+        else:
+            self.curve_peaks.setData([], [])
+            self.peaks_list_label.setText("- (tidak ada puncak signifikan)")
+            self.peak_fft_label.setText("-")
+
+        # --- terapkan Start/Stop frequency range ---
+        try:
+            f_start = float(self.fft_start_edit.text())
+            f_stop = float(self.fft_stop_edit.text())
+            if f_start <= 0:
+                f_start = 0.1
+            if f_stop > f_start:
+                self.plot_fft.setXRange(np.log10(f_start), np.log10(f_stop), padding=0)
+        except ValueError:
+            pass
 
     # ---------------- Plot waveform ----------------
     def _redraw_time(self, *_):
